@@ -1,0 +1,107 @@
+---
+- name: Validate vm setup inputs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    vm_setup_group_tier_map:
+      linux_vm_setup_t0: T0
+      linux_vm_setup_t1: T1
+      linux_vm_setup_t2: T2
+    vm_setup_expected_admin_key_files:
+      - "{{ playbook_dir }}/../../files/admin1.pub"
+      - "{{ playbook_dir }}/../../files/admin2.pub"
+      - "{{ playbook_dir }}/../../files/admin3.pub"
+    vm_setup_expected_ntp_files:
+      - "{{ playbook_dir }}/../../files/50-evr-ntp-deb.conf"
+      - "{{ playbook_dir }}/../../files/50-evr-ntp-ocl.conf"
+  tasks:
+    - name: Require target_group input
+      ansible.builtin.assert:
+        that:
+          - target_group is defined
+          - target_group | trim | length > 0
+        fail_msg: "target_group is required."
+
+    - name: Require arc_tier input
+      ansible.builtin.assert:
+        that:
+          - arc_tier is defined
+          - arc_tier in ['T0', 'T1', 'T2']
+        fail_msg: "arc_tier must be one of: T0, T1, T2."
+
+    - name: Enforce explicit execution confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_apply is defined
+          - confirm_apply == "YES"
+        fail_msg: "VM setup requires -e confirm_apply=YES"
+
+    - name: Require target_group to exist in inventory
+      ansible.builtin.assert:
+        that:
+          - target_group in groups
+          - groups[target_group] | length > 0
+        fail_msg: "target_group '{{ target_group }}' is missing or has no hosts."
+
+    - name: Require supported target_group for tier mapping
+      ansible.builtin.assert:
+        that:
+          - target_group in vm_setup_group_tier_map
+        fail_msg: >-
+          target_group '{{ target_group }}' is not supported for VM setup.
+          Allowed groups: {{ vm_setup_group_tier_map.keys() | join(', ') }}.
+
+    - name: Enforce target_group and arc_tier consistency
+      ansible.builtin.assert:
+        that:
+          - vm_setup_group_tier_map[target_group] == arc_tier
+        fail_msg: >-
+          Mismatch: target_group '{{ target_group }}' expects tier
+          '{{ vm_setup_group_tier_map[target_group] }}' but arc_tier is '{{ arc_tier }}'.
+
+    - name: Check admin public key files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ vm_setup_expected_admin_key_files }}"
+      register: vm_setup_admin_key_stats
+
+    - name: Check NTP drop-in files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ vm_setup_expected_ntp_files }}"
+      register: vm_setup_ntp_file_stats
+
+    - name: Warn when admin key files are missing
+      ansible.builtin.debug:
+        msg: "Admin key files missing in repo. User creation will run but authorized_keys task will be skipped."
+      when: (vm_setup_admin_key_stats.results | selectattr('stat.exists', 'equalto', false) | list | length) > 0
+
+    - name: Warn when NTP files are missing
+      ansible.builtin.debug:
+        msg: "NTP drop-in files missing in repo. NTP configuration task will be skipped."
+      when: (vm_setup_ntp_file_stats.results | selectattr('stat.exists', 'equalto', false) | list | length) > 0
+
+- name: Validate host compatibility and sudo access
+  hosts: "{{ target_group | default('linux_vm_setup_t1') }}"
+  gather_facts: true
+  tasks:
+    - name: Require supported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'Debian' or ansible_facts.distribution == 'OracleLinux'
+        fail_msg: >-
+          Unsupported OS: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}.
+          Supported: Debian and Oracle Linux.
+
+    - name: Verify sudo/become works
+      ansible.builtin.command: id -u
+      become: true
+      changed_when: false
+      register: vm_setup_root_uid
+
+    - name: Confirm become user is root
+      ansible.builtin.assert:
+        that:
+          - vm_setup_root_uid.stdout == "0"
+        fail_msg: "Sudo/become validation failed for host {{ inventory_hostname }}."

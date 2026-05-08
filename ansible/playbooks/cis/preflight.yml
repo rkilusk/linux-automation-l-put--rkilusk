@@ -1,0 +1,53 @@
+---
+- name: Validate input and inventory before remote execution
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require target_group input
+      ansible.builtin.assert:
+        that:
+          - target_group is defined
+          - target_group | trim | length > 0
+        fail_msg: "target_group is required. Example: -e target_group=linux_cis"
+
+    - name: Require target_group to exist in inventory
+      ansible.builtin.assert:
+        that:
+          - target_group in groups
+          - groups[target_group] | length > 0
+        fail_msg: "target_group '{{ target_group }}' is missing or has no hosts in inventory."
+
+- name: Validate host compatibility and sudo access
+  # Default keeps static analyzers/lint happy; first play still enforces explicit input at runtime.
+  hosts: "{{ target_group | default('linux_cis') }}"
+  gather_facts: true
+  tasks:
+    - name: Require supported operating system
+      ansible.builtin.assert:
+        that:
+          - >
+            (
+              ansible_facts.distribution == 'Debian' and
+              ansible_facts.distribution_major_version == '12'
+            ) or
+            (
+              ansible_facts.os_family == 'RedHat' and
+              ansible_facts.distribution in ['OracleLinux', 'RedHat']
+            )
+        fail_msg: >-
+          Unsupported OS: {{ ansible_facts.distribution }}
+          {{ ansible_facts.distribution_version }}.
+          Supported: Debian 12 and Oracle Linux (RHEL role path).
+
+    - name: Verify sudo/become works
+      ansible.builtin.command: id -u
+      become: true
+      changed_when: false
+      register: preflight_root_uid
+
+    - name: Confirm become user is root
+      ansible.builtin.assert:
+        that:
+          - preflight_root_uid.stdout == "0"
+        fail_msg: "Sudo/become validation failed for host {{ inventory_hostname }}."

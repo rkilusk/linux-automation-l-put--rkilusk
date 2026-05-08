@@ -1,0 +1,10 @@
+---
+# Shared defaults for VM setup onboarding groups.
+ansible_user: ansible
+ansible_become: true
+ansible_become_method: sudo
+
+vm_setup_admin_users:
+  - admin1
+  - admin2
+  - admin3

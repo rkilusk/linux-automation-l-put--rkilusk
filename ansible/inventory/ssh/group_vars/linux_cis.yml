@@ -1,0 +1,19 @@
+---
+# Shared defaults for CIS-targeted hosts only.
+ansible_user: ansible
+ansible_become: true
+ansible_become_method: sudo
+
+cis_report_dir: "{{ playbook_dir }}/../../reports"
+cis_default_benchmark_level: level1
+cis_default_profile: level1-server
+cis_supported_profiles:
+  - level1-server
+  - level1-workstation
+  - level2-server
+  - level2-workstation
+
+# Make upstream role fetch audit output back to controller (self-hosted runner workspace).
+fetch_audit_output: true
+audit_output_collection_method: fetch
+audit_output_destination: ansible/reports/raw/

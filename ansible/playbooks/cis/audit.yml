@@ -1,0 +1,46 @@
+---
+- name: CIS audit wrapper
+  hosts: all
+  gather_facts: true
+  vars:
+    cis_effective_profile: "{{ cis_profile | default((benchmark_level | default(cis_default_benchmark_level)) ~ '-server') }}"
+    cis_effective_benchmark_level: "{{ 'level1' if cis_effective_profile.startswith('level1-') else 'level2' }}"
+  pre_tasks:
+    - name: Validate audit role variable
+      tags: always
+      ansible.builtin.assert:
+        that:
+          - cis_audit_role is defined
+          - cis_audit_role | trim | length > 0
+        fail_msg: "cis_audit_role must be defined in inventory group_vars."
+
+    - name: Validate CIS profile
+      tags: always
+      ansible.builtin.assert:
+        that:
+          - cis_effective_profile in cis_supported_profiles
+        fail_msg: >-
+          Invalid cis_profile '{{ cis_effective_profile }}'.
+          Allowed values: {{ cis_supported_profiles | join(', ') }}.
+
+    - name: Build benchmark mapping flags
+      tags: always
+      ansible.builtin.set_fact:
+        cis_level1_selected: "{{ cis_effective_benchmark_level == 'level1' }}"
+        cis_level2_selected: "{{ cis_effective_benchmark_level == 'level2' }}"
+
+  tasks:
+    - name: Run dynamic CIS audit role
+      tags: always
+      ansible.builtin.include_role:
+        name: "{{ cis_audit_role }}"
+      vars:
+        run_audit: true
+        audit_only: true
+        setup_audit: true
+        cis_profile: "{{ cis_effective_profile }}"
+        benchmark_level: "{{ cis_effective_benchmark_level }}"
+        deb12cis_level_1: "{{ cis_level1_selected }}"
+        deb12cis_level_2: "{{ cis_level2_selected }}"
+        rhel10cis_level_1: "{{ cis_level1_selected }}"
+        rhel10cis_level_2: "{{ cis_level2_selected }}"

@@ -1,0 +1,243 @@
+name: vCenter Snapshot Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Snapshot operation"
+        required: true
+        type: choice
+        options:
+          - create
+          - delete
+        default: create
+      target_group:
+        description: "Inventory group to target"
+        required: true
+        type: choice
+        options:
+          - linux_snapshot_t1
+          - linux_snapshot_t0
+          - linux_snapshot_targets
+        default: linux_snapshot_t1
+      retention_days:
+        description: "Used for delete operation"
+        required: true
+        type: string
+        default: "3"
+      run_lint:
+        description: "Run lint and syntax checks on GitHub-hosted runner"
+        required: true
+        type: boolean
+        default: true
+      confirm_delete:
+        description: "Required for manual delete: YES"
+        required: true
+        type: string
+        default: "NO"
+  schedule:
+    - cron: "45 1 * * 3"
+      timezone: "Europe/Tallinn"
+    - cron: "30 5 * * 6"
+      timezone: "Europe/Tallinn"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vcenter-snapshot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Lint and Syntax Check
+    if: ${{ github.event_name == 'schedule' || inputs.run_lint }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible ansible-lint
+
+      - name: Install vCenter collections
+        run: |
+          ansible-galaxy collection install \
+            -r ansible/requirements/vcenter-collections.yml
+
+      - name: Ansible lint
+        run: ansible-lint ansible/playbooks/vcenter/*.yml
+
+      - name: Syntax check preflight
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/vcenter/hosts.yml \
+            ansible/playbooks/vcenter/preflight.yml \
+            --syntax-check \
+            -e "target_group=linux_snapshot_t1"
+
+      - name: Syntax check create
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/vcenter/hosts.yml \
+            ansible/playbooks/vcenter/create.yml \
+            --syntax-check \
+            -e "target_group=linux_snapshot_t1"
+
+      - name: Syntax check delete
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/vcenter/hosts.yml \
+            ansible/playbooks/vcenter/delete.yml \
+            --syntax-check \
+            -e "target_group=linux_snapshot_t1"
+
+  snapshot:
+    name: Snapshot Run
+    needs: lint
+    if: ${{ always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
+    runs-on: [self-hosted, Linux, vcenter]
+
+    env:
+      ANSIBLE_FORCE_COLOR: "True"
+      ANSIBLE_STDOUT_CALLBACK: yaml
+      VMWARE_HOST: ${{ secrets.VMWARE_HOST }}
+      VMWARE_USER: ${{ secrets.VMWARE_USER }}
+      VMWARE_PASSWORD: ${{ secrets.VMWARE_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve effective operation and target
+        id: resolve
+        shell: bash
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          SCHEDULE_EXPR="${{ github.event.schedule }}"
+          LOCAL_DOM=$(TZ=Europe/Tallinn date +%-d)
+          LOCAL_DOW=$(TZ=Europe/Tallinn date +%u)
+
+          OPERATION=""
+          TARGET_GROUP=""
+          RETENTION_DAYS="3"
+          SHOULD_RUN="false"
+          REASON="No matching schedule window."
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            OPERATION="${{ inputs.operation }}"
+            TARGET_GROUP="${{ inputs.target_group }}"
+            RETENTION_DAYS="${{ inputs.retention_days }}"
+            SHOULD_RUN="true"
+            REASON="Manual workflow_dispatch trigger."
+          elif [ "$SCHEDULE_EXPR" = "45 1 * * 3" ]; then
+            if [ "$LOCAL_DOW" -eq 3 ] && [ "$LOCAL_DOM" -ge 8 ] && [ "$LOCAL_DOM" -le 14 ]; then
+              OPERATION="create"
+              TARGET_GROUP="linux_snapshot_t1"
+              SHOULD_RUN="true"
+              REASON="Scheduled T1 pre-update snapshot window (second Wednesday)."
+            elif [ "$LOCAL_DOW" -eq 3 ] && [ "$LOCAL_DOM" -ge 15 ] && [ "$LOCAL_DOM" -le 21 ]; then
+              OPERATION="create"
+              TARGET_GROUP="linux_snapshot_t0"
+              SHOULD_RUN="true"
+              REASON="Scheduled T0 pre-update snapshot window (third Wednesday)."
+            else
+              REASON="Create schedule is limited to second and third Wednesday."
+            fi
+          elif [ "$SCHEDULE_EXPR" = "30 5 * * 6" ]; then
+            OPERATION="delete"
+            TARGET_GROUP="linux_snapshot_targets"
+            RETENTION_DAYS="3"
+            SHOULD_RUN="true"
+            REASON="Scheduled retention cleanup window (Saturday 05:30 Europe/Tallinn)."
+          fi
+
+          echo "operation=$OPERATION" >> "$GITHUB_OUTPUT"
+          echo "target_group=$TARGET_GROUP" >> "$GITHUB_OUTPUT"
+          echo "retention_days=$RETENTION_DAYS" >> "$GITHUB_OUTPUT"
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          echo "schedule_expr=${SCHEDULE_EXPR:-n/a}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify runner tooling
+        if: steps.resolve.outputs.should_run == 'true'
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "python3 is not installed on this self-hosted runner."
+            exit 1
+          fi
+          if ! command -v ansible-playbook >/dev/null 2>&1; then
+            echo "ansible-playbook is not installed on this self-hosted runner."
+            exit 1
+          fi
+          python3 --version
+          ansible --version
+          ansible-playbook --version
+
+      - name: Install VMware collection
+        if: steps.resolve.outputs.should_run == 'true'
+        run: |
+          ansible-galaxy collection install \
+            -r ansible/requirements/vcenter-collections.yml
+
+      - name: Preflight checks
+        if: steps.resolve.outputs.should_run == 'true'
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/vcenter/hosts.yml \
+            ansible/playbooks/vcenter/preflight.yml \
+            -e "target_group=${{ steps.resolve.outputs.target_group }}"
+
+      - name: Create snapshots
+        if: steps.resolve.outputs.should_run == 'true' && steps.resolve.outputs.operation == 'create'
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/vcenter/hosts.yml \
+            ansible/playbooks/vcenter/create.yml \
+            -e "target_group=${{ steps.resolve.outputs.target_group }}"
+
+      - name: Delete snapshots
+        if: steps.resolve.outputs.should_run == 'true' && steps.resolve.outputs.operation == 'delete'
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.confirm_delete }}" != "YES" ]; then
+            echo "Manual delete requires confirm_delete=YES"
+            exit 1
+          fi
+
+          ansible-playbook \
+            -i ansible/inventory/vcenter/hosts.yml \
+            ansible/playbooks/vcenter/delete.yml \
+            -e "target_group=${{ steps.resolve.outputs.target_group }}" \
+            -e "snapshot_retention_days=${{ steps.resolve.outputs.retention_days }}"
+
+      - name: GitHub summary
+        if: always()
+        shell: bash
+        run: |
+          OP="${{ steps.resolve.outputs.operation }}"
+          TG="${{ steps.resolve.outputs.target_group }}"
+          RD="${{ steps.resolve.outputs.retention_days }}"
+          SCH="${{ steps.resolve.outputs.schedule_expr }}"
+          [ -z "$OP" ] && OP="n/a"
+          [ -z "$TG" ] && TG="n/a"
+          [ -z "$RD" ] && RD="n/a"
+          [ -z "$SCH" ] && SCH="n/a"
+          {
+            echo "## vCenter Snapshot Workflow Summary"
+            echo ""
+            echo "- Event: \`${{ github.event_name }}\`"
+            echo "- Schedule expression: \`$SCH\`"
+            echo "- Should run: \`${{ steps.resolve.outputs.should_run }}\`"
+            echo "- Operation: \`$OP\`"
+            echo "- Target group: \`$TG\`"
+            echo "- Retention days: \`$RD\`"
+            echo "- Reason: \`${{ steps.resolve.outputs.reason }}\`"
+            echo "- Workflow run: \`${{ github.run_id }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,49 @@
+---
+- name: Validate snapshot workflow inputs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require target_group input
+      ansible.builtin.assert:
+        that:
+          - target_group is defined
+          - target_group | trim | length > 0
+        fail_msg: "target_group is required."
+
+    - name: Require target_group to exist in inventory
+      ansible.builtin.assert:
+        that:
+          - target_group in groups
+          - groups[target_group] | length > 0
+        fail_msg: "target_group '{{ target_group }}' is missing or has no hosts in inventory."
+
+    - name: Require vCenter environment variables
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'VMWARE_HOST') | trim | length > 0
+          - lookup('env', 'VMWARE_USER') | trim | length > 0
+          - lookup('env', 'VMWARE_PASSWORD') | trim | length > 0
+        fail_msg: "VMWARE_HOST, VMWARE_USER and VMWARE_PASSWORD must be set."
+
+- name: Validate per-host vCenter variables
+  hosts: "{{ target_group | default('linux_snapshot_targets') }}"
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require cluster_name or datacenter_name
+      ansible.builtin.assert:
+        that:
+          - >
+            (
+              cluster_name is defined
+              and cluster_name | trim | length > 0
+              and cluster_name != "CHANGE_ME"
+            )
+            or
+            (
+              datacenter_name is defined
+              and datacenter_name | trim | length > 0
+              and datacenter_name != "CHANGE_ME"
+            )
+        fail_msg: "cluster_name (or datacenter_name) must be set for host {{ inventory_hostname }}."

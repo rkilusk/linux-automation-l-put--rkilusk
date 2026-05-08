@@ -1,0 +1,5 @@
+---
+snapshot_prefix: "enne-turvauuendust-"
+snapshot_retention_days: 3
+snapshot_serial: 3
+vmware_validate_certs: false

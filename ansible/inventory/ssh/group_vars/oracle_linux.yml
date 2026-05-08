@@ -1,0 +1,15 @@
+---
+cis_audit_role: rhel10_cis
+cis_remediation_role: rhel10_cis
+
+# Required by Ansible-Lockdown role: default placeholder value is blocked by assertion.
+rhel10cis_authselect_custom_profile_name: cis_oraclelinux10_profile
+
+# Oracle Linux-specific repo/GPG behavior (aligned with upstream role vars/OracleLinux.yml).
+os_gpg_key_pubkey_name: gpg-pubkey-8d8b756f-629e59ec
+os_gpg_key_pubkey_content: "Oracle Linux (release key 1) <secalert_us@oracle.com>"
+rhel10cis_rule_enable_repogpg: false
+
+# PoC test override:
+# upstream role asserts root account state for this control and fails early on non-compliant lab hosts.
+# rhel10cis_rule_5_4_2_4: false

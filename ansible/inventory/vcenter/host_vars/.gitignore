@@ -1,0 +1,3 @@
+# Legacy local files from earlier layout; vCenter VM metadata is now inline in hosts.yml
+*.yml
+!.gitignore

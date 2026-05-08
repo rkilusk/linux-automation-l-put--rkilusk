@@ -1,0 +1,15 @@
+---
+# Pin to validated upstream commits for reproducible automation runs.
+# NOTE:
+# - The *-CIS-Audit repositories are standalone audit content, not Ansible roles.
+# - They are consumed by the remediation roles when run_audit/audit_only is enabled.
+roles:
+  - name: debian12_cis
+    src: https://github.com/ansible-lockdown/DEBIAN12-CIS.git
+    scm: git
+    version: "2.0.4"
+
+  - name: rhel10_cis
+    src: https://github.com/ansible-lockdown/RHEL10-CIS.git
+    scm: git
+    version: "1.0.2"

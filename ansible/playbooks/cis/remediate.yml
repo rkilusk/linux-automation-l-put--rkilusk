@@ -1,0 +1,55 @@
+---
+- name: CIS remediation wrapper
+  hosts: all
+  gather_facts: true
+  serial: 1
+  vars:
+    cis_effective_profile: "{{ cis_profile | default((benchmark_level | default(cis_default_benchmark_level)) ~ '-server') }}"
+    cis_effective_benchmark_level: "{{ 'level1' if cis_effective_profile.startswith('level1-') else 'level2' }}"
+  pre_tasks:
+    - name: Enforce explicit remediation confirmation
+      tags: always
+      ansible.builtin.assert:
+        that:
+          - confirm_remediation is defined
+          - confirm_remediation == "YES"
+        fail_msg: "Remediation requires -e confirm_remediation=YES"
+
+    - name: Validate remediation role variable
+      tags: always
+      ansible.builtin.assert:
+        that:
+          - cis_remediation_role is defined
+          - cis_remediation_role | trim | length > 0
+        fail_msg: "cis_remediation_role must be defined in inventory group_vars."
+
+    - name: Validate CIS profile
+      tags: always
+      ansible.builtin.assert:
+        that:
+          - cis_effective_profile in cis_supported_profiles
+        fail_msg: >-
+          Invalid cis_profile '{{ cis_effective_profile }}'.
+          Allowed values: {{ cis_supported_profiles | join(', ') }}.
+
+    - name: Build benchmark mapping flags
+      tags: always
+      ansible.builtin.set_fact:
+        cis_level1_selected: "{{ cis_effective_benchmark_level == 'level1' }}"
+        cis_level2_selected: "{{ cis_effective_benchmark_level == 'level2' }}"
+
+  tasks:
+    - name: Run dynamic CIS remediation role
+      tags: always
+      ansible.builtin.include_role:
+        name: "{{ cis_remediation_role }}"
+      vars:
+        run_audit: true
+        setup_audit: true
+        audit_only: false
+        cis_profile: "{{ cis_effective_profile }}"
+        benchmark_level: "{{ cis_effective_benchmark_level }}"
+        deb12cis_level_1: "{{ cis_level1_selected }}"
+        deb12cis_level_2: "{{ cis_level2_selected }}"
+        rhel10cis_level_1: "{{ cis_level1_selected }}"
+        rhel10cis_level_2: "{{ cis_level2_selected }}"

@@ -1,0 +1,35 @@
+---
+- name: Create VMware snapshot before updates
+  hosts: "{{ target_group | default('linux_snapshot_targets') }}"
+  connection: local
+  gather_facts: false
+  serial: "{{ snapshot_serial | default(3) }}"
+  vars:
+    vcenter_host: "{{ lookup('env', 'VMWARE_HOST') }}"
+    vcenter_user: "{{ lookup('env', 'VMWARE_USER') }}"
+    vcenter_pass: "{{ lookup('env', 'VMWARE_PASSWORD') }}"
+    vm_datacenter: "{{ cluster_name | default(datacenter_name) }}"
+    ts_compact: "{{ lookup('pipe', 'date -u +%Y-%m-%d_%H-%M-%SZ') }}"
+    effective_vm_name: "{{ vm_name | default(inventory_hostname) }}"
+    default_folder: "/{{ vm_datacenter }}/vm/"
+    snapshot_name: "{{ snapshot_prefix | default('enne-turvauuendust-') }}{{ effective_vm_name }}-{{ ts_compact }}"
+    snapshot_description: |
+      Snapshot before Azure Arc security updates.
+      Created {{ ts_compact }} by GitHub run {{ lookup('env', 'GITHUB_RUN_ID') | default('manual', true) }}
+      Keep: false
+
+  tasks:
+    - name: Create snapshot
+      vmware.vmware.vm_snapshot:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_user }}"
+        password: "{{ vcenter_pass }}"
+        validate_certs: "{{ vmware_validate_certs | default(false) }}"
+        datacenter: "{{ vm_datacenter }}"
+        folder: "{{ vm_folder | default(default_folder) }}"
+        name: "{{ effective_vm_name }}"
+        state: present
+        memory_dump: true
+        snapshot_name: "{{ snapshot_name }}"
+        description: "{{ snapshot_description }}"
+      no_log: true

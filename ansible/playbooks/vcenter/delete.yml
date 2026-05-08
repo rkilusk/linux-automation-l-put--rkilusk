@@ -1,0 +1,67 @@
+---
+- name: Delete VMware pre-update snapshots
+  hosts: "{{ target_group | default('linux_snapshot_targets') }}"
+  connection: local
+  gather_facts: false
+  serial: "{{ snapshot_serial | default(3) }}"
+  vars:
+    vcenter_host: "{{ lookup('env', 'VMWARE_HOST') }}"
+    vcenter_user: "{{ lookup('env', 'VMWARE_USER') }}"
+    vcenter_pass: "{{ lookup('env', 'VMWARE_PASSWORD') }}"
+    vm_datacenter: "{{ cluster_name | default(datacenter_name) }}"
+    retention_days: "{{ snapshot_retention_days | default(3) | int }}"
+    retention_seconds: "{{ retention_days * 86400 }}"
+    snapshot_prefix_value: "{{ snapshot_prefix | default('enne-turvauuendust-') }}"
+    effective_vm_name: "{{ vm_name | default(inventory_hostname) }}"
+    default_folder: "/{{ vm_datacenter }}/vm/"
+
+  tasks:
+    - name: Get current timestamp
+      ansible.builtin.set_fact:
+        now_ts: "{{ lookup('pipe', 'date +%s') | int }}"
+
+    - name: Get snapshot info
+      community.vmware.vmware_guest_snapshot_info:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_user }}"
+        password: "{{ vcenter_pass }}"
+        validate_certs: "{{ vmware_validate_certs | default(false) }}"
+        datacenter: "{{ vm_datacenter }}"
+        folder: "{{ vm_folder | default(default_folder) }}"
+        name: "{{ effective_vm_name }}"
+      register: snap_info
+      no_log: true
+
+    - name: Build candidate snapshot list
+      ansible.builtin.set_fact:
+        candidate_snapshots: "{{ snap_info.guest_snapshots.snapshots | default([]) }}"
+
+    - name: Delete snapshots older than retention and marked Keep false
+      vmware.vmware.vm_snapshot:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_user }}"
+        password: "{{ vcenter_pass }}"
+        validate_certs: "{{ vmware_validate_certs | default(false) }}"
+        datacenter: "{{ vm_datacenter }}"
+        folder: "{{ vm_folder | default(default_folder) }}"
+        name: "{{ effective_vm_name }}"
+        snapshot_name: "{{ item.name }}"
+        state: absent
+      loop: "{{ candidate_snapshots }}"
+      when:
+        - item.name is defined
+        - item.name.startswith(snapshot_prefix_value)
+        - item.description is defined
+        - "'Keep: false' in item.description"
+        - item.creation_time is defined
+        - >
+          (
+            now_ts - (
+              item.creation_time
+              | regex_replace(':00$', '00')
+              | to_datetime(format='%Y-%m-%dT%H:%M:%S.%f%z')
+              | strftime('%s')
+              | int
+            )
+          ) > retention_seconds
+      no_log: true

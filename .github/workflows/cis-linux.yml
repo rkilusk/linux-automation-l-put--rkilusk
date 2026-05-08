@@ -1,0 +1,205 @@
+name: CIS Linux audit/remediate
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_group:
+        description: "Inventory group to target"
+        required: true
+        type: choice
+        options:
+          - debian12
+          - oracle_linux
+          - linux_cis
+        default: "linux_cis"
+      mode:
+        description: "Execution mode"
+        required: true
+        type: choice
+        options:
+          - audit
+          - remediate
+        default: audit
+      cis_profile:
+        description: "CIS profile (tags)"
+        required: true
+        type: choice
+        options:
+          - level1-server
+          - level1-workstation
+          - level2-server
+          - level2-workstation
+        default: level1-server
+      run_lint:
+        description: "Run lint and syntax checks on GitHub-hosted runner"
+        required: true
+        type: boolean
+        default: true
+      confirm_remediation:
+        description: "Required for remediation mode: YES"
+        required: true
+        type: string
+        default: "NO"
+
+jobs:
+  lint:
+    name: Lint and Syntax Check
+    if: ${{ inputs.run_lint }}
+    runs-on: ubuntu-latest
+    env:
+      ANSIBLE_ROLES_PATH: ansible/roles
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible ansible-lint
+
+      - name: Install pinned CIS roles
+        run: |
+          ansible-galaxy install \
+            -r ansible/requirements/cis-lockdown.yml \
+            --roles-path ansible/roles
+
+      - name: Ansible lint
+        run: ansible-lint ansible/playbooks/cis/*.yml
+
+      - name: Syntax check preflight
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/ssh/hosts.yml \
+            ansible/playbooks/cis/preflight.yml \
+            --syntax-check \
+            -e "target_group=linux_cis"
+
+      - name: Syntax check audit
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/ssh/hosts.yml \
+            ansible/playbooks/cis/audit.yml \
+            --syntax-check \
+            -e "cis_profile=level1-server"
+
+      - name: Syntax check remediate
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/ssh/hosts.yml \
+            ansible/playbooks/cis/remediate.yml \
+            --syntax-check \
+            -e "confirm_remediation=YES" \
+            -e "cis_profile=level1-server"
+
+  cis:
+    name: CIS Run
+    needs: lint
+    if: ${{ always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
+    runs-on: [self-hosted, linux, cis]
+
+    env:
+      ANSIBLE_ROLES_PATH: ansible/roles
+      ANSIBLE_HOST_KEY_CHECKING: "True"
+      ANSIBLE_FORCE_COLOR: "True"
+      ANSIBLE_BECOME_PASS: ${{ secrets.ANSIBLE_BECOME_PASSWORD }}
+      REPORT_DIR: ansible/reports/${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Prepare report directory
+        run: |
+          rm -rf "${REPORT_DIR}" ansible/reports/raw
+          mkdir -p "${REPORT_DIR}/raw"
+
+      - name: Verify runner tooling
+        run: |
+          if ! command -v ansible-playbook >/dev/null 2>&1; then
+            echo "ansible-playbook is not installed on this self-hosted runner."
+            exit 1
+          fi
+          ansible --version
+          ansible-playbook --version
+          if command -v ansible-lint >/dev/null 2>&1; then
+            ansible-lint --version
+          else
+            echo "ansible-lint not found on self-hosted runner (not required for CIS execution)."
+          fi
+
+      - name: Install pinned CIS roles
+        run: |
+          ansible-galaxy install \
+            -r ansible/requirements/cis-lockdown.yml \
+            --roles-path ansible/roles
+
+      - name: Preflight checks
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/ssh/hosts.yml \
+            ansible/playbooks/cis/preflight.yml \
+            -e "target_group=${{ inputs.target_group }}"
+
+      - name: Execute CIS mode
+        run: |
+          CIS_LEVEL=""
+          CIS_TAG="${{ inputs.cis_profile }}"
+
+          if [[ "${{ inputs.cis_profile }}" == level1-* ]]; then
+            CIS_LEVEL="level1"
+          else
+            CIS_LEVEL="level2"
+          fi
+
+          if [ "${{ inputs.mode }}" = "audit" ]; then
+            ansible-playbook \
+              -i ansible/inventory/ssh/hosts.yml \
+              ansible/playbooks/cis/audit.yml \
+              -e "benchmark_level=${CIS_LEVEL}" \
+              -e "cis_profile=${CIS_TAG}" \
+              -e "audit_output_destination=${GITHUB_WORKSPACE}/${REPORT_DIR}/raw/" \
+              --tags "${CIS_TAG},run_audit,setup_audit,audit_only,prelim_tasks,always" \
+              --skip-tags "patch" \
+              -l "${{ inputs.target_group }}"
+          else
+            ansible-playbook \
+              -i ansible/inventory/ssh/hosts.yml \
+              ansible/playbooks/cis/remediate.yml \
+              -e "benchmark_level=${CIS_LEVEL}" \
+              -e "cis_profile=${CIS_TAG}" \
+              -e "audit_output_destination=${GITHUB_WORKSPACE}/${REPORT_DIR}/raw/" \
+              -e "confirm_remediation=${{ inputs.confirm_remediation }}" \
+              --tags "${CIS_TAG},run_audit,setup_audit,prelim_tasks,post_tasks,always" \
+              -l "${{ inputs.target_group }}"
+          fi
+
+      - name: Collect CIS reports
+        if: always()
+        run: |
+          bash scripts/cis/collect-results.sh
+
+      - name: Upload reports artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cis-reports-${{ github.run_id }}
+          path: ${{ env.REPORT_DIR }}/
+          if-no-files-found: warn
+
+      - name: GitHub summary
+        if: always()
+        run: |
+          {
+            echo "## CIS Workflow Summary"
+            echo ""
+            echo "- Mode: \`${{ inputs.mode }}\`"
+            echo "- Target group: \`${{ inputs.target_group }}\`"
+            echo "- CIS profile: \`${{ inputs.cis_profile }}\`"
+            echo "- Lint enabled: \`${{ inputs.run_lint }}\`"
+            echo "- Reports path: \`${REPORT_DIR}/\`"
+            echo "- Workflow run: \`${{ github.run_id }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

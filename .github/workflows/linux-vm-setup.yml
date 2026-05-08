@@ -1,0 +1,221 @@
+name: Linux VM Setup Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_group:
+        description: "Inventory group to target"
+        required: true
+        type: choice
+        options:
+          - linux_vm_setup_t0
+          - linux_vm_setup_t1
+          - linux_vm_setup_t2
+        default: linux_vm_setup_t1
+      arc_tier:
+        description: "Azure Arc tier script"
+        required: true
+        type: choice
+        options:
+          - T0
+          - T1
+          - T2
+        default: T1
+      run_lint:
+        description: "Run lint and syntax checks on GitHub-hosted runner"
+        required: true
+        type: boolean
+        default: true
+      allow_partial_setup:
+        description: "Allow run when admin pubkeys / NTP files are missing"
+        required: true
+        type: boolean
+        default: true
+      confirm_apply:
+        description: "Required for apply mode: YES"
+        required: true
+        type: string
+        default: "NO"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-vm-setup-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Lint and Syntax Check
+    if: ${{ inputs.run_lint }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible ansible-lint
+
+      - name: Ansible lint
+        run: ansible-lint ansible/playbooks/vm_setup/*.yml
+
+      - name: Syntax check preflight
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/ssh/hosts.yml \
+            ansible/playbooks/vm_setup/preflight.yml \
+            --syntax-check \
+            -e "target_group=linux_vm_setup_t1" \
+            -e "arc_tier=T1" \
+            -e "confirm_apply=YES"
+
+      - name: Syntax check apply
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/ssh/hosts.yml \
+            ansible/playbooks/vm_setup/apply.yml \
+            --syntax-check \
+            -e "target_group=linux_vm_setup_t1" \
+            -e "arc_tier=T1" \
+            -e "confirm_apply=YES" \
+            -e "arc_script_local_path=/tmp/arc-onboard.sh" \
+            -e "vm_setup_admin_keys_ready=false" \
+            -e "vm_setup_ntp_files_ready=false"
+
+  vm_setup:
+    name: VM Setup Run
+    needs: lint
+    if: ${{ always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
+    runs-on: [self-hosted, linux, cis]
+    env:
+      ANSIBLE_FORCE_COLOR: "True"
+      ANSIBLE_HOST_KEY_CHECKING: "True"
+      ANSIBLE_PRIVATE_KEY_FILE: /tmp/ansible_ssh_key
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate required secrets
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.ANSIBLE_SSH_PRIVATE_KEY }}
+          ARC_SCRIPT_T0: ${{ secrets.ARC_SCRIPT_T0 }}
+          ARC_SCRIPT_T1: ${{ secrets.ARC_SCRIPT_T1 }}
+          ARC_SCRIPT_T2: ${{ secrets.ARC_SCRIPT_T2 }}
+        run: |
+          test -n "$SSH_KEY" || { echo "Missing secret: ANSIBLE_SSH_PRIVATE_KEY"; exit 1; }
+          test -n "$ARC_SCRIPT_T0" || { echo "Missing secret: ARC_SCRIPT_T0"; exit 1; }
+          test -n "$ARC_SCRIPT_T1" || { echo "Missing secret: ARC_SCRIPT_T1"; exit 1; }
+          test -n "$ARC_SCRIPT_T2" || { echo "Missing secret: ARC_SCRIPT_T2"; exit 1; }
+
+      - name: Inspect optional repo files
+        id: optional
+        shell: bash
+        run: |
+          ADMIN_KEYS_READY=true
+          NTP_FILES_READY=true
+
+          for f in \
+            ansible/files/admin1.pub \
+            ansible/files/admin2.pub \
+            ansible/files/admin3.pub; do
+            [ -f "$f" ] || ADMIN_KEYS_READY=false
+          done
+
+          for f in \
+            ansible/files/50-evr-ntp-deb.conf \
+            ansible/files/50-evr-ntp-ocl.conf; do
+            [ -f "$f" ] || NTP_FILES_READY=false
+          done
+
+          echo "admin_keys_ready=$ADMIN_KEYS_READY" >> "$GITHUB_OUTPUT"
+          echo "ntp_files_ready=$NTP_FILES_READY" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce strict mode when partial setup is disabled
+        if: ${{ !inputs.allow_partial_setup }}
+        shell: bash
+        run: |
+          if [ "${{ steps.optional.outputs.admin_keys_ready }}" != "true" ]; then
+            echo "allow_partial_setup=false but admin pubkey files are missing."
+            exit 1
+          fi
+          if [ "${{ steps.optional.outputs.ntp_files_ready }}" != "true" ]; then
+            echo "allow_partial_setup=false but NTP drop-in files are missing."
+            exit 1
+          fi
+
+      - name: Prepare SSH private key for Ansible
+        shell: bash
+        run: |
+          umask 077
+          mkdir -p "$(dirname "$ANSIBLE_PRIVATE_KEY_FILE")"
+          printf '%s\n' "${{ secrets.ANSIBLE_SSH_PRIVATE_KEY }}" > "$ANSIBLE_PRIVATE_KEY_FILE"
+          chmod 600 "$ANSIBLE_PRIVATE_KEY_FILE"
+
+      - name: Select Arc script by tier
+        id: arc
+        shell: bash
+        env:
+          ARC_SCRIPT_T0: ${{ secrets.ARC_SCRIPT_T0 }}
+          ARC_SCRIPT_T1: ${{ secrets.ARC_SCRIPT_T1 }}
+          ARC_SCRIPT_T2: ${{ secrets.ARC_SCRIPT_T2 }}
+        run: |
+          ARC_SCRIPT_FILE="${RUNNER_TEMP}/arc-onboard.sh"
+          case "${{ inputs.arc_tier }}" in
+            T0) printf '%s\n' "$ARC_SCRIPT_T0" > "$ARC_SCRIPT_FILE" ;;
+            T1) printf '%s\n' "$ARC_SCRIPT_T1" > "$ARC_SCRIPT_FILE" ;;
+            T2) printf '%s\n' "$ARC_SCRIPT_T2" > "$ARC_SCRIPT_FILE" ;;
+            *) echo "Unsupported arc_tier value"; exit 1 ;;
+          esac
+          chmod 600 "$ARC_SCRIPT_FILE"
+          test -s "$ARC_SCRIPT_FILE" || { echo "Selected Arc script is empty"; exit 1; }
+          echo "arc_script_path=$ARC_SCRIPT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight checks
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/ssh/hosts.yml \
+            ansible/playbooks/vm_setup/preflight.yml \
+            -e "target_group=${{ inputs.target_group }}" \
+            -e "arc_tier=${{ inputs.arc_tier }}" \
+            -e "confirm_apply=${{ inputs.confirm_apply }}"
+
+      - name: Apply vm setup baseline
+        run: |
+          ansible-playbook \
+            -i ansible/inventory/ssh/hosts.yml \
+            ansible/playbooks/vm_setup/apply.yml \
+            -e "target_group=${{ inputs.target_group }}" \
+            -e "arc_tier=${{ inputs.arc_tier }}" \
+            -e "confirm_apply=${{ inputs.confirm_apply }}" \
+            -e "arc_script_local_path=${{ steps.arc.outputs.arc_script_path }}" \
+            -e "vm_setup_admin_keys_ready=${{ steps.optional.outputs.admin_keys_ready }}" \
+            -e "vm_setup_ntp_files_ready=${{ steps.optional.outputs.ntp_files_ready }}"
+
+      - name: GitHub summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Linux VM Setup Workflow Summary"
+            echo ""
+            echo "- Target group: \`${{ inputs.target_group }}\`"
+            echo "- Arc tier: \`${{ inputs.arc_tier }}\`"
+            echo "- Allow partial setup: \`${{ inputs.allow_partial_setup }}\`"
+            echo "- Admin keys applied candidate: \`${{ steps.optional.outputs.admin_keys_ready }}\`"
+            echo "- NTP config applied candidate: \`${{ steps.optional.outputs.ntp_files_ready }}\`"
+            if [ "${{ steps.optional.outputs.admin_keys_ready }}" != "true" ]; then
+              echo "- Admin keys note: \`missing repo files -> authorized_keys skipped\`"
+            fi
+            if [ "${{ steps.optional.outputs.ntp_files_ready }}" != "true" ]; then
+              echo "- NTP note: \`missing repo files -> ntp drop-in skipped\`"
+            fi
+            echo "- Workflow run: \`${{ github.run_id }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

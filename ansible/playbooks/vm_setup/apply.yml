@@ -1,0 +1,219 @@
+---
+- name: Apply Linux VM setup baseline
+  hosts: "{{ target_group | default('linux_vm_setup_t1') }}"
+  gather_facts: true
+  vars:
+    vm_setup_admin_sudo_group: "{{ 'sudo' if ansible_facts.os_family == 'Debian' else 'wheel' }}"
+    vm_setup_ssh_service_name: "{{ 'ssh' if ansible_facts.os_family == 'Debian' else 'sshd' }}"
+  pre_tasks:
+    - name: Validate required vm setup inputs
+      tags: always
+      ansible.builtin.assert:
+        that:
+          - target_group is defined
+          - arc_tier is defined
+          - confirm_apply is defined
+          - confirm_apply == "YES"
+        fail_msg: "target_group, arc_tier and confirm_apply=YES are required."
+
+    - name: Check Arc script exists on controller
+      tags: always
+      ansible.builtin.stat:
+        path: "{{ arc_script_local_path }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: vm_setup_arc_script_stat
+
+    - name: Require Arc script from workflow secret
+      tags: always
+      ansible.builtin.assert:
+        that:
+          - vm_setup_arc_script_stat.stat.exists
+        fail_msg: "Arc script file is missing on controller. Check ARC_SCRIPT_T* secret setup."
+      run_once: true
+
+    - name: Set optional file flags
+      tags: always
+      ansible.builtin.set_fact:
+        vm_setup_admin_keys_ready_bool: "{{ (vm_setup_admin_keys_ready | default(false)) | bool }}"
+        vm_setup_ntp_files_ready_bool: "{{ (vm_setup_ntp_files_ready | default(false)) | bool }}"
+
+  tasks:
+    - name: Update apt cache and packages (Debian)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        upgrade: "yes"
+      become: true
+      when: ansible_facts.os_family == 'Debian'
+
+    - name: Update packages (Oracle Linux)
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_only: true
+      become: true
+      when: ansible_facts.distribution == 'OracleLinux'
+
+    - name: Install open-vm-tools
+      ansible.builtin.package:
+        name: open-vm-tools
+        state: present
+      become: true
+
+    - name: Ensure open-vm-tools service is enabled and running
+      ansible.builtin.service:
+        name: open-vm-tools
+        enabled: true
+        state: started
+      become: true
+
+    - name: Ensure admin users exist
+      ansible.builtin.user:
+        name: "{{ item }}"
+        shell: /bin/bash
+        create_home: true
+        groups: "{{ vm_setup_admin_sudo_group }}"
+        append: true
+        password_lock: true
+      become: true
+      loop: "{{ vm_setup_admin_users }}"
+
+    - name: Ensure passwordless sudo for admin users
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-automation-admins
+        owner: root
+        group: root
+        mode: "0440"
+        content: |
+          admin1 ALL=(ALL) NOPASSWD:ALL
+          admin2 ALL=(ALL) NOPASSWD:ALL
+          admin3 ALL=(ALL) NOPASSWD:ALL
+        validate: /usr/sbin/visudo -cf %s
+      become: true
+
+    - name: Install admin authorized keys
+      ansible.posix.authorized_key:
+        user: "{{ item }}"
+        key: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../files/' ~ item ~ '.pub') }}"
+        state: present
+      become: true
+      loop: "{{ vm_setup_admin_users }}"
+      when: vm_setup_admin_keys_ready_bool
+
+    - name: Configure sshd hardening drop-in
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../files/99-evr-harden-ssh.conf"
+        dest: /etc/ssh/sshd_config.d/99-evr-harden-ssh.conf
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      notify: Restart SSH daemon
+
+    - name: Ensure Debian timesyncd drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/timesyncd.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+      when:
+        - vm_setup_ntp_files_ready_bool
+        - ansible_facts.os_family == 'Debian'
+
+    - name: Deploy Debian NTP drop-in
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../files/50-evr-ntp-deb.conf"
+        dest: /etc/systemd/timesyncd.conf.d/50-evr-ntp.conf
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when:
+        - vm_setup_ntp_files_ready_bool
+        - ansible_facts.os_family == 'Debian'
+      notify: Restart Debian time service
+
+    - name: Ensure Oracle chrony drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/chrony.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+      when:
+        - vm_setup_ntp_files_ready_bool
+        - ansible_facts.distribution == 'OracleLinux'
+
+    - name: Deploy Oracle Linux NTP drop-in
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../files/50-evr-ntp-ocl.conf"
+        dest: /etc/chrony.d/50-evr-ntp.conf
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+      when:
+        - vm_setup_ntp_files_ready_bool
+        - ansible_facts.distribution == 'OracleLinux'
+      notify: Restart Oracle time service
+
+    - name: Check Azure Arc agent status
+      ansible.builtin.command: azcmagent show --json
+      become: true
+      register: vm_setup_arc_status
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Decide if Azure Arc onboarding is needed
+      ansible.builtin.set_fact:
+        vm_setup_arc_connected: "{{ vm_setup_arc_status.rc == 0 and ('Connected' in vm_setup_arc_status.stdout) }}"
+      no_log: true
+
+    - name: Copy tier-specific Arc onboarding script
+      ansible.builtin.copy:
+        src: "{{ arc_script_local_path }}"
+        dest: /tmp/arc-onboard.sh
+        owner: root
+        group: root
+        mode: "0700"
+      become: true
+      when: not vm_setup_arc_connected
+      no_log: true
+
+    - name: Run Arc onboarding script
+      ansible.builtin.command: bash /tmp/arc-onboard.sh
+      become: true
+      when: not vm_setup_arc_connected
+      no_log: true
+
+    - name: Remove Arc onboarding script
+      ansible.builtin.file:
+        path: /tmp/arc-onboard.sh
+        state: absent
+      become: true
+      when: not vm_setup_arc_connected
+
+  handlers:
+    - name: Restart SSH daemon
+      ansible.builtin.service:
+        name: "{{ vm_setup_ssh_service_name }}"
+        state: restarted
+      become: true
+
+    - name: Restart Debian time service
+      ansible.builtin.service:
+        name: systemd-timesyncd
+        state: restarted
+      become: true
+
+    - name: Restart Oracle time service
+      ansible.builtin.service:
+        name: chronyd
+        state: restarted
+      become: true
