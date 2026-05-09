@@ -8,10 +8,8 @@
     vcenter_host: "{{ lookup('env', 'VMWARE_HOST') }}"
     vcenter_user: "{{ lookup('env', 'VMWARE_USER') }}"
     vcenter_pass: "{{ lookup('env', 'VMWARE_PASSWORD') }}"
-    vm_datacenter: "{{ cluster_name | default(datacenter_name) }}"
     ts_compact: "{{ lookup('pipe', 'date -u +%Y-%m-%d_%H-%M-%SZ') }}"
     effective_vm_name: "{{ vm_name | default(inventory_hostname) }}"
-    default_folder: "/{{ vm_datacenter }}/vm/"
     snapshot_name: "{{ snapshot_prefix | default('enne-turvauuendust-') }}{{ effective_vm_name }}-{{ ts_compact }}"
     snapshot_description: |
       Snapshot before Azure Arc security updates.
@@ -19,14 +17,44 @@
       Keep: false
 
   tasks:
+    - name: Discover VM folder from vCenter
+      community.vmware.vmware_guest_find:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_user }}"
+        password: "{{ vcenter_pass }}"
+        validate_certs: "{{ vmware_validate_certs | default(false) }}"
+        name: "{{ effective_vm_name }}"
+      register: vm_lookup
+      no_log: true
+
+    - name: Validate discovered VM folder
+      ansible.builtin.assert:
+        that:
+          - vm_lookup.folders is defined
+          - vm_lookup.folders | length > 0
+        fail_msg: "Could not discover folder for VM {{ effective_vm_name }} from vCenter."
+
+    - name: Resolve effective VM location
+      ansible.builtin.set_fact:
+        effective_vm_folder: "{{ vm_lookup.folders | first }}"
+        effective_vm_datacenter: "{{ (vm_lookup.folders | first | regex_replace('^/', '') | split('/') | first) }}"
+
+    - name: Show resolved VMware locator
+      ansible.builtin.debug:
+        msg:
+          - "vm={{ effective_vm_name }}"
+          - "datacenter={{ effective_vm_datacenter }}"
+          - "folder={{ effective_vm_folder }}"
+
     - name: Create snapshot
       vmware.vmware.vm_snapshot:
         hostname: "{{ vcenter_host }}"
         username: "{{ vcenter_user }}"
         password: "{{ vcenter_pass }}"
         validate_certs: "{{ vmware_validate_certs | default(false) }}"
-        datacenter: "{{ vm_datacenter }}"
-        folder: "{{ vm_folder | default(default_folder) }}"
+        datacenter: "{{ effective_vm_datacenter }}"
+        folder: "{{ effective_vm_folder }}"
+        folder_paths_are_absolute: true
         name: "{{ effective_vm_name }}"
         state: present
         memory_dump: true

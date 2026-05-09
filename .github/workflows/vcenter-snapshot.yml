@@ -108,6 +108,7 @@ jobs:
     env:
       ANSIBLE_FORCE_COLOR: "True"
       ANSIBLE_STDOUT_CALLBACK: yaml
+      ANSIBLE_PYTHON_INTERPRETER: ${{ github.workspace }}/.venv-vcenter/bin/python
       VMWARE_HOST: ${{ secrets.VMWARE_HOST }}
       VMWARE_USER: ${{ secrets.VMWARE_USER }}
       VMWARE_PASSWORD: ${{ secrets.VMWARE_PASSWORD }}
@@ -179,6 +180,13 @@ jobs:
           python3 --version
           ansible --version
           ansible-playbook --version
+
+      - name: Prepare Python venv for VMware modules
+        if: steps.resolve.outputs.should_run == 'true'
+        run: |
+          python3 -m venv "${GITHUB_WORKSPACE}/.venv-vcenter"
+          "${GITHUB_WORKSPACE}/.venv-vcenter/bin/python" -m pip install --upgrade pip
+          "${GITHUB_WORKSPACE}/.venv-vcenter/bin/python" -m pip install pyvmomi requests
 
       - name: Install VMware collection
         if: steps.resolve.outputs.should_run == 'true'

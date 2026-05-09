@@ -40,13 +40,14 @@ Create schedule logic validates tier windows against `Europe/Tallinn` local date
 
 ## Required host/group vars
 
-- `cluster_name` is required for each targeted VM (or `datacenter_name` for backward compatibility).
+- `cluster_name` / `datacenter_name` are now metadata only for this workflow.
 - Optional:
-  - `vm_folder` (default `/<cluster_or_datacenter>/vm/`)
+  - `vm_folder` (optional metadata)
   - `vm_name` (default `inventory_hostname`)
   - `cluster_name` (metadata placeholder for future targeting/reporting)
   - `esxi_host_name` (metadata placeholder for future targeting/reporting)
 - In current PoC layout, per-VM variables are defined inline under each host in `ansible/inventory/vcenter/hosts.yml`.
+- Runtime VM location is discovered automatically via `community.vmware.vmware_guest_find` by VM name.
 
 Defaults in `ansible/inventory/vcenter/group_vars/linux_snapshot_targets.yml`:
 
